@@ -8,13 +8,11 @@
       monospace;
     margin: 2rem;
   }
-  canvas {
+  canvas,
+  svg {
     max-width: 80svw;
     border: 1px solid #ccc;
     image-rendering: pixelated;
-  }
-  svg {
-    border: 1px solid #ccc;
   }
   fieldset {
     border: 1px solid #ccc;
@@ -82,7 +80,9 @@
   const previewCtx = previewCanvas.getContext("2d");
 
   const params = {
-    outputWidthMM: 100.0,
+    pageWidthMM: 210.0,
+    pageHeightMM: 297.0,
+    marginMM: 10.0,
     lineWidthMM: 2.0,
     overlap: 0.85,
     colPitchMM: 0.4,
@@ -103,7 +103,12 @@
 
   let outputWidthPixels = 0;
   let outputHeightPixels = 0;
-  let outputHeightMM = 0;
+
+  let drawWidthMM = 0;
+  let drawHeightMM = 0;
+  let offsetXMM = 0;
+  let offsetYMM = 0;
+  let rowPitchMM = 0;
 
   const markerColors = [
     "black",
@@ -149,15 +154,26 @@
   function reprocess() {
     if (!grayscaleImage) return;
 
-    outputHeightMM =
-      params.outputWidthMM * (sourceHeightPixels / sourceWidthPixels);
-    const rowPitchMM = params.lineWidthMM * params.overlap;
+    const availableWidthMM = params.pageWidthMM - 2 * params.marginMM;
+    const availableHeightMM = params.pageHeightMM - 2 * params.marginMM;
+    const aspect = sourceHeightPixels / sourceWidthPixels;
 
-    outputHeightPixels = Math.max(1, Math.round(outputHeightMM / rowPitchMM));
+    drawWidthMM = Math.min(availableWidthMM, availableHeightMM / aspect);
+    drawHeightMM = drawWidthMM * aspect;
+
+    offsetXMM = (params.pageWidthMM - drawWidthMM) / 2;
+    offsetYMM = (params.pageHeightMM - drawHeightMM) / 2;
+
+    outputHeightPixels = Math.max(
+      1,
+      Math.round(drawHeightMM / (params.lineWidthMM * params.overlap)),
+    );
     outputWidthPixels = Math.max(
       1,
-      Math.round(params.outputWidthMM / params.colPitchMM),
+      Math.round(drawWidthMM / params.colPitchMM),
     );
+
+    rowPitchMM = drawHeightMM / outputHeightPixels;
 
     downsampledImage = downsample(
       grayscaleImage,
@@ -185,58 +201,66 @@
       outputHeightPixels,
     );
 
-    const scale = Math.min(800 / params.outputWidthMM, 800 / outputHeightMM);
-    page.width = Math.round(params.outputWidthMM * scale);
-    page.height = Math.round(outputHeightMM * scale);
+    const screenScale = Math.min(
+      800 / params.pageWidthMM,
+      800 / params.pageHeightMM,
+    );
+    page.width = Math.round(params.pageWidthMM * screenScale);
+    page.height = Math.round(params.pageHeightMM * screenScale);
 
-    svg.setAttribute("width", `${params.outputWidthMM}mm`);
-    svg.setAttribute("height", `${outputHeightMM}mm`);
-    svg.setAttribute("viewBox", `0 0 ${page.width} ${page.height}`);
+    pageCtx.setTransform(screenScale, 0, 0, screenScale, 0, 0);
+    pageCtx.fillStyle = "#ffffff";
+    pageCtx.fillRect(0, 0, params.pageWidthMM, params.pageHeightMM);
+    pageCtx.lineCap = "round";
+    pageCtx.lineWidth = params.lineWidthMM;
+
+    svg.setAttribute("width", `${params.pageWidthMM}mm`);
+    svg.setAttribute("height", `${params.pageHeightMM}mm`);
+    svg.setAttribute(
+      "viewBox",
+      `0 0 ${params.pageWidthMM} ${params.pageHeightMM}`,
+    );
     svg.innerHTML = "";
 
-    const rowHeightPixels = Math.round(page.height / outputHeightPixels);
-    const strokeWidthPixels =
-      (params.lineWidthMM / outputHeightMM) * page.height;
+    const bandCount = thresholds.length + 1;
+
+    const frag = document.createDocumentFragment();
 
     for (const [key, pathList] of Object.entries(paths)) {
-      if (Number(key) === 0 || Number(key) === DEFAULT_COLOR_BAND_COUNT - 1)
-        continue;
-      const color = markerColors[key];
+      const band = Number(key);
+      if (band === 0 || band === bandCount - 1) continue;
+      const color = markerColors[band];
+
+      let d = "";
+      pageCtx.beginPath();
+      pageCtx.strokeStyle = color;
 
       for (const path of pathList) {
-        pageCtx.beginPath();
-        pageCtx.strokeStyle = color;
-        pageCtx.lineWidth = strokeWidthPixels;
-        pageCtx.lineCap = "round";
+        const x1 = offsetXMM + (path[0].x / outputWidthPixels) * drawWidthMM;
+        const x2 = offsetXMM + (path[1].x / outputWidthPixels) * drawWidthMM;
+        const y =
+          offsetYMM +
+          (path[0].y / outputHeightPixels) * drawHeightMM +
+          rowPitchMM / 2;
 
-        const x1 = (path[0].x / outputWidthPixels) * page.width;
-        const y1 =
-          (path[0].y / outputHeightPixels) * page.height + rowHeightPixels / 2;
+        pageCtx.moveTo(x1, y);
+        pageCtx.lineTo(x2, y);
 
-        const x2 = (path[1].x / outputWidthPixels) * page.width;
-        const y2 =
-          (path[1].y / outputHeightPixels) * page.height + rowHeightPixels / 2;
-
-        pageCtx.moveTo(x1, y1);
-        pageCtx.lineTo(x2, y2);
-
-        pageCtx.stroke();
-
-        const line = document.createElementNS(
-          "http://www.w3.org/2000/svg",
-          "line",
-        );
-        line.setAttribute("x1", x1);
-        line.setAttribute("y1", y1);
-        line.setAttribute("x2", x2);
-        line.setAttribute("y2", y2);
-        line.setAttribute("stroke", color);
-        line.setAttribute("stroke-width", strokeWidthPixels);
-        line.setAttribute("stroke-linecap", "round");
-
-        svg.appendChild(line);
+        d += `M${x1.toFixed(3)} ${y.toFixed(3)}L${x2.toFixed(3)} ${y.toFixed(3)}`;
       }
+
+      pageCtx.stroke();
+
+      const el = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      el.setAttribute("d", d);
+      el.setAttribute("fill", "none");
+      el.setAttribute("stroke", color);
+      el.setAttribute("stroke-width", params.lineWidthMM);
+      el.setAttribute("stroke-linecap", "round");
+      frag.appendChild(el);
     }
+
+    svg.appendChild(frag);
   }
 
   function toGrayscale(image, width, height) {
@@ -306,7 +330,7 @@
 
       for (let x = 1; x <= width; x++) {
         const color = x < width ? image[row + x] : -1;
-        if (color === lastValue || x - 1 === startX) continue;
+        if (color === lastValue) continue;
 
         (paths[lastValue] ??= []).push([
           { x: startX, y },
@@ -350,10 +374,20 @@
 
   function buildSizeControls() {
     sizeControls.innerHTML = "";
-    numberRow(sizeControls, "width", "mm", "outputWidthMM", {
+    numberRow(sizeControls, "page width", "mm", "pageWidthMM", {
       min: 10,
       max: 2000,
       step: 5,
+    });
+    numberRow(sizeControls, "page height", "mm", "pageHeightMM", {
+      min: 10,
+      max: 2000,
+      step: 5,
+    });
+    numberRow(sizeControls, "margin", "mm", "marginMM", {
+      min: 0,
+      max: 200,
+      step: 1,
     });
     numberRow(sizeControls, "pen width", "mm", "lineWidthMM", {
       min: 0.05,
