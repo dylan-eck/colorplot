@@ -1,0 +1,131 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>grayscale</title>
+<style>
+  body {
+    font:
+      13px ui-monospace,
+      monospace;
+    margin: 2rem;
+  }
+  canvas {
+    max-width: 80svw;
+    border: 1px solid #ccc;
+    image-rendering: pixelated;
+  }
+  pre {
+    white-space: pre-wrap;
+  }
+</style>
+
+<input type="file" id="file" accept="image/*" />
+<p id="info"></p>
+<canvas id="page"></canvas>
+<pre id="sample"></pre>
+
+<script>
+  const page = document.getElementById("page");
+  const pageCtx = page.getContext("2d", { willReadFrequently: true });
+
+  document.getElementById("file").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const bmp = await createImageBitmap(file);
+    let { width: sourceWidthPixels, height: sourceHeightPixels } = bmp;
+
+    sourceWidthPixels = sourceWidthPixels;
+    sourceHeightPixels = sourceHeightPixels;
+
+    page.width = sourceWidthPixels;
+    page.height = sourceHeightPixels;
+    pageCtx.drawImage(bmp, 0, 0);
+    bmp.close();
+
+    const rgba = pageCtx.getImageData(
+      0,
+      0,
+      sourceWidthPixels,
+      sourceHeightPixels,
+    ).data;
+
+    const sourcePixels = new Uint8ClampedArray(
+      sourceWidthPixels * sourceHeightPixels,
+    );
+    for (let i = 0, p = 0; p < sourcePixels.length; i += 4, p++) {
+      sourcePixels[p] =
+        0.2126 * rgba[i] + 0.7152 * rgba[i + 1] + 0.0722 * rgba[i + 2];
+    }
+
+    // processing
+    const outputWidthMM = 100.0;
+    const outputHeightMM =
+      outputWidthMM * (sourceHeightPixels / sourceWidthPixels);
+
+    const lineWidthMM = 2.0;
+    const overlap = 0.85;
+
+    const rowPitchMM = lineWidthMM * overlap;
+    const colPitchMM = 0.4;
+
+    const outputHeightPixels = Math.round(outputHeightMM / rowPitchMM);
+    const outputWidthPixels = Math.round(outputWidthMM / colPitchMM);
+
+    const small = new Uint8ClampedArray(outputWidthPixels * outputHeightPixels);
+    for (let outY = 0; outY < outputHeightPixels; outY++) {
+      const y0 = Math.floor((outY * sourceHeightPixels) / outputHeightPixels);
+      const y1 = Math.max(
+        y0 + 1,
+        Math.floor(((outY + 1) * sourceHeightPixels) / outputHeightPixels),
+      );
+      for (let outX = 0; outX < outputWidthPixels; outX++) {
+        const x0 = Math.floor((outX * sourceWidthPixels) / outputWidthPixels);
+        const x1 = Math.max(
+          x0 + 1,
+          Math.floor(((outX + 1) * sourceWidthPixels) / outputWidthPixels),
+        );
+
+        let sum = 0;
+        for (let y = y0; y < y1; y++) {
+          const row = y * sourceWidthPixels;
+          for (let x = x0; x < x1; x++) {
+            sum += sourcePixels[row + x];
+          }
+        }
+
+        small[outY * outputWidthPixels + outX] = sum / ((y1 - y0) * (x1 - x0));
+      }
+    }
+
+    const previewCanvas = document.createElement("canvas");
+    const previewContext = previewCanvas.getContext("2d");
+    previewCanvas.width = outputWidthPixels;
+    previewCanvas.height = outputHeightPixels;
+
+    const thresholds = [50, 80, 90];
+    const bandCount = thresholds.length + 1;
+
+    const out = previewContext.createImageData(
+      outputWidthPixels,
+      outputHeightPixels,
+    );
+    for (let p = 0, i = 0; p < small.length; p++, i += 4) {
+      const o = (quantize(small[p], thresholds) / (bandCount - 1)) * 255;
+      out.data[i] = out.data[i + 1] = out.data[i + 2] = o;
+      out.data[i + 3] = 255;
+    }
+    previewContext.putImageData(out, 0, 0);
+
+    const scale = Math.min(800 / outputWidthMM, 800 / outputHeightMM);
+    page.width = Math.round(outputWidthMM * scale);
+    page.height = Math.round(outputHeightMM * scale);
+    pageCtx.imageSmoothingEnabled = false;
+    pageCtx.drawImage(previewCanvas, 0, 0, page.width, page.height);
+  });
+
+  function quantize(v, thresholds) {
+    let band = 0;
+    while (band < thresholds.length && v >= thresholds[band]) band++;
+    return band;
+  }
+</script>
