@@ -59,13 +59,10 @@
 </fieldset>
 
 <canvas id="page"></canvas>
-<svg id="vec"></svg>
 
 <script>
   const page = document.getElementById("page");
   const pageCtx = page.getContext("2d");
-
-  const svg = document.getElementById("vec");
 
   const sizeControls = document.getElementById("sizeControls");
   const bandControls = document.getElementById("bandControls");
@@ -86,6 +83,7 @@
     lineWidthMM: 2.0,
     overlap: 0.85,
     colPitchMM: 0.4,
+    scale: 1.0,
   };
 
   const DEFAULT_COLOR_BAND_COUNT = 6;
@@ -93,6 +91,12 @@
     { length: DEFAULT_COLOR_BAND_COUNT - 1 },
     (_, k) => (k + 1) / DEFAULT_COLOR_BAND_COUNT,
   );
+
+  let svgs = Array.from({ length: DEFAULT_COLOR_BAND_COUNT }, (_, k) => {
+    let v = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    if (k !== 0 && k !== DEFAULT_COLOR_BAND_COUNT - 1) document.body.append(v);
+    return v;
+  });
 
   let grayscaleImage = null;
   let sourceWidthPixels = 0;
@@ -158,7 +162,8 @@
     const availableHeightMM = params.pageHeightMM - 2 * params.marginMM;
     const aspect = sourceHeightPixels / sourceWidthPixels;
 
-    drawWidthMM = Math.min(availableWidthMM, availableHeightMM / aspect);
+    drawWidthMM =
+      Math.min(availableWidthMM, availableHeightMM / aspect) * params.scale;
     drawHeightMM = drawWidthMM * aspect;
 
     offsetXMM = (params.pageWidthMM - drawWidthMM) / 2;
@@ -214,13 +219,15 @@
     pageCtx.lineCap = "round";
     pageCtx.lineWidth = params.lineWidthMM;
 
-    svg.setAttribute("width", `${params.pageWidthMM}mm`);
-    svg.setAttribute("height", `${params.pageHeightMM}mm`);
-    svg.setAttribute(
-      "viewBox",
-      `0 0 ${params.pageWidthMM} ${params.pageHeightMM}`,
-    );
-    svg.innerHTML = "";
+    svgs.forEach((svg) => {
+      svg.setAttribute("width", `${params.pageWidthMM}mm`);
+      svg.setAttribute("height", `${params.pageHeightMM}mm`);
+      svg.setAttribute(
+        "viewBox",
+        `0 0 ${params.pageWidthMM} ${params.pageHeightMM}`,
+      );
+      svg.innerHTML = "";
+    });
 
     const bandCount = thresholds.length + 1;
 
@@ -257,10 +264,8 @@
       el.setAttribute("stroke", color);
       el.setAttribute("stroke-width", params.lineWidthMM);
       el.setAttribute("stroke-linecap", "round");
-      frag.appendChild(el);
+      svgs[band].appendChild(el);
     }
-
-    svg.appendChild(frag);
   }
 
   function toGrayscale(image, width, height) {
@@ -403,6 +408,11 @@
       min: 0.05,
       max: 10,
       step: 0.1,
+    });
+    numberRow(sizeControls, "scale", "x", "scale", {
+      min: 0.05,
+      max: 2,
+      step: 0.05,
     });
   }
 
