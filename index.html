@@ -1,471 +1,395 @@
 <!doctype html>
-<meta charset="utf-8" />
-<title>Multi Color Plot Generator</title>
-<style>
-  body {
-    font:
-      13px ui-monospace,
-      monospace;
-    margin: 2rem;
-  }
-  canvas,
-  svg {
-    max-width: 80svw;
-    border: 1px solid #ccc;
-    image-rendering: pixelated;
-  }
-  fieldset {
-    border: 1px solid #ccc;
-    max-width: 512px;
-    margin: 1rem 0;
-    padding: 0.6rem 0.9rem 0.9rem;
-  }
-  legend {
-    padding: 0 0.4rem;
-    color: #666;
-  }
-  .grid {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    gap: 0.4rem 0.8rem;
-    align-items: center;
-  }
-  .grid input[type="range"] {
-    width: 100%;
-  }
-  .grid input[type="number"] {
-    width: 100%;
-    font: inherit;
-  }
-  label {
-    white-space: nowrap;
-  }
-  .unit {
-    color: #666;
-  }
-</style>
-
-<input type="file" id="file-input" accept="image/*" />
-<p id="info"></p>
-
-<fieldset>
-  <legend>output</legend>
-  <div class="grid" id="sizeControls"></div>
-</fieldset>
-
-<fieldset>
-  <legend>bands</legend>
-  <div class="grid" id="bandControls"></div>
-</fieldset>
-
-<canvas id="page"></canvas>
-
-<script>
-  const page = document.getElementById("page");
-  const pageCtx = page.getContext("2d");
-
-  const sizeControls = document.getElementById("sizeControls");
-  const bandControls = document.getElementById("bandControls");
-  const info = document.getElementById("info");
-
-  const scratchCanvas = document.createElement("canvas");
-  const scratchCtx = scratchCanvas.getContext("2d", {
-    willReadFrequently: true,
-  });
-
-  const previewCanvas = document.createElement("canvas");
-  const previewCtx = previewCanvas.getContext("2d");
-
-  const params = {
-    pageWidthMM: 210.0,
-    pageHeightMM: 297.0,
-    marginMM: 10.0,
-    lineWidthMM: 2.0,
-    overlap: 0.85,
-    colPitchMM: 0.4,
-    scale: 1.0,
-  };
-
-  const DEFAULT_COLOR_BAND_COUNT = 6;
-  let thresholds = Array.from(
-    { length: DEFAULT_COLOR_BAND_COUNT - 1 },
-    (_, k) => (k + 1) / DEFAULT_COLOR_BAND_COUNT,
-  );
-
-  let svgs = Array.from({ length: DEFAULT_COLOR_BAND_COUNT }, (_, k) => {
-    let v = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    if (k !== 0 && k !== DEFAULT_COLOR_BAND_COUNT - 1) document.body.append(v);
-    return v;
-  });
-
-  let grayscaleImage = null;
-  let sourceWidthPixels = 0;
-  let sourceHeightPixels = 0;
-
-  let downsampledImage = null;
-  let quantizedImage = null;
-
-  let outputWidthPixels = 0;
-  let outputHeightPixels = 0;
-
-  let drawWidthMM = 0;
-  let drawHeightMM = 0;
-  let offsetXMM = 0;
-  let offsetYMM = 0;
-  let rowPitchMM = 0;
-
-  const markerColors = [
-    "black",
-    "#d8a5f2",
-    "#ff8ca1",
-    "#f7d773",
-    "#fbfc72",
-    "white",
-  ];
-
-  const THRESHOLD_STEP = 0.001;
-
-  document
-    .getElementById("file-input")
-    .addEventListener("change", async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-
-      const bmp = await createImageBitmap(file);
-      sourceWidthPixels = bmp.width;
-      sourceHeightPixels = bmp.height;
-
-      scratchCanvas.width = sourceWidthPixels;
-      scratchCanvas.height = sourceHeightPixels;
-      scratchCtx.drawImage(bmp, 0, 0);
-      bmp.close();
-
-      const sourcePixels = scratchCtx.getImageData(
-        0,
-        0,
-        sourceWidthPixels,
-        sourceHeightPixels,
-      ).data;
-
-      grayscaleImage = normalize(
-        toGrayscale(sourcePixels, sourceWidthPixels, sourceHeightPixels),
-      );
-
-      buildSizeControls();
-      reprocess();
-    });
-
-  function reprocess() {
-    if (!grayscaleImage) return;
-
-    const availableWidthMM = params.pageWidthMM - 2 * params.marginMM;
-    const availableHeightMM = params.pageHeightMM - 2 * params.marginMM;
-    const aspect = sourceHeightPixels / sourceWidthPixels;
-
-    drawWidthMM =
-      Math.min(availableWidthMM, availableHeightMM / aspect) * params.scale;
-    drawHeightMM = drawWidthMM * aspect;
-
-    offsetXMM = (params.pageWidthMM - drawWidthMM) / 2;
-    offsetYMM = (params.pageHeightMM - drawHeightMM) / 2;
-
-    outputHeightPixels = Math.max(
-      1,
-      Math.round(drawHeightMM / (params.lineWidthMM * params.overlap)),
-    );
-    outputWidthPixels = Math.max(
-      1,
-      Math.round(drawWidthMM / params.colPitchMM),
-    );
-
-    rowPitchMM = drawHeightMM / outputHeightPixels;
-
-    downsampledImage = downsample(
-      grayscaleImage,
-      sourceWidthPixels,
-      sourceHeightPixels,
-      outputWidthPixels,
-      outputHeightPixels,
-    );
-
-    previewCanvas.width = outputWidthPixels;
-    previewCanvas.height = outputHeightPixels;
-
-    buildBandControls();
-    redraw();
-  }
-
-  function redraw() {
-    if (!downsampledImage) return;
-
-    quantizedImage = quantize(downsampledImage, thresholds);
-    paths = extractPaths(quantizedImage, outputWidthPixels, outputHeightPixels);
-
-    const out = previewCtx.createImageData(
-      outputWidthPixels,
-      outputHeightPixels,
-    );
-
-    const screenScale = Math.min(
-      800 / params.pageWidthMM,
-      800 / params.pageHeightMM,
-    );
-    page.width = Math.round(params.pageWidthMM * screenScale);
-    page.height = Math.round(params.pageHeightMM * screenScale);
-
-    pageCtx.setTransform(screenScale, 0, 0, screenScale, 0, 0);
-    pageCtx.fillStyle = "#ffffff";
-    pageCtx.fillRect(0, 0, params.pageWidthMM, params.pageHeightMM);
-    pageCtx.lineCap = "round";
-    pageCtx.lineWidth = params.lineWidthMM;
-
-    svgs.forEach((svg) => {
-      svg.setAttribute("width", `${params.pageWidthMM}mm`);
-      svg.setAttribute("height", `${params.pageHeightMM}mm`);
-      svg.setAttribute(
-        "viewBox",
-        `0 0 ${params.pageWidthMM} ${params.pageHeightMM}`,
-      );
-      svg.innerHTML = "";
-    });
-
-    const bandCount = thresholds.length + 1;
-
-    const frag = document.createDocumentFragment();
-
-    for (const [key, pathList] of Object.entries(paths)) {
-      const band = Number(key);
-      if (band === 0 || band === bandCount - 1) continue;
-      const color = markerColors[band];
-
-      let d = "";
-      pageCtx.beginPath();
-      pageCtx.strokeStyle = color;
-
-      for (const path of pathList) {
-        const x1 = offsetXMM + (path[0].x / outputWidthPixels) * drawWidthMM;
-        const x2 = offsetXMM + (path[1].x / outputWidthPixels) * drawWidthMM;
-        const y =
-          offsetYMM +
-          (path[0].y / outputHeightPixels) * drawHeightMM +
-          rowPitchMM / 2;
-
-        pageCtx.moveTo(x1, y);
-        pageCtx.lineTo(x2, y);
-
-        d += `M${x1.toFixed(3)} ${y.toFixed(3)}L${x2.toFixed(3)} ${y.toFixed(3)}`;
-      }
-
-      pageCtx.stroke();
-
-      const el = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      el.setAttribute("d", d);
-      el.setAttribute("fill", "none");
-      el.setAttribute("stroke", color);
-      el.setAttribute("stroke-width", params.lineWidthMM);
-      el.setAttribute("stroke-linecap", "round");
-      svgs[band].appendChild(el);
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+  </head>
+  <style>
+    body,
+    html {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      background-color: #3e3e3e;
     }
-  }
 
-  function toGrayscale(image, width, height) {
-    const result = new Float32Array(width * height);
-    for (let i = 0, p = 0; p < result.length; i += 4, p++) {
-      result[p] =
-        0.2126 * image[i] + 0.7152 * image[i + 1] + 0.0722 * image[i + 2];
+    canvas {
+      --ratio: 1;
+      aspect-ratio: var(--ratio);
+      width: min(90svw, 90svh * var(--ratio));
+      height: auto;
+      background-color: white;
     }
-    return result;
-  }
 
-  function normalize(pixels) {
-    let min = 255;
-    let max = 0;
-    for (let i = 0; i < pixels.length; i++) {
-      const v = pixels[i];
-      if (v < min) min = v;
-      if (v > max) max = v;
+    .container {
+      width: 100svw;
+      height: 100svh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
     }
-    const scale = max > min ? 1 / (max - min) : 0;
+  </style>
+  <body>
+    <div class="container">
+      <canvas id="page"></canvas>
+    </div>
 
-    const result = new Float32Array(pixels.length);
-    for (let i = 0; i < result.length; i++) {
-      result[i] = (pixels[i] - min) * scale;
-    }
-    return result;
-  }
-
-  function downsample(src, sw, sh, dw, dh) {
-    const out = new Float32Array(dw * dh);
-    for (let outY = 0; outY < dh; outY++) {
-      const y0 = Math.floor((outY * sh) / dh);
-      const y1 = Math.max(y0 + 1, Math.floor(((outY + 1) * sh) / dh));
-      for (let outX = 0; outX < dw; outX++) {
-        const x0 = Math.floor((outX * sw) / dw);
-        const x1 = Math.max(x0 + 1, Math.floor(((outX + 1) * sw) / dw));
-
-        let sum = 0;
-        for (let y = y0; y < y1; y++) {
-          const row = y * sw;
-          for (let x = x0; x < x1; x++) sum += src[row + x];
+    <script type="importmap">
+      {
+        "imports": {
+          "tweakpane": "https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js",
+          "tweakpane-plugin-file-import": "https://unpkg.com/tweakpane-plugin-file-import@1.2.0/dist/tweakpane-plugin-file-import.js"
         }
-        out[outY * dw + outX] = sum / ((y1 - y0) * (x1 - x0));
       }
-    }
-    return out;
-  }
+    </script>
 
-  function quantize(pixelArray, thresholds) {
-    const result = new Uint8ClampedArray(pixelArray.length);
-    for (let i = 0; i < pixelArray.length; i++) {
-      let band = 0;
-      while (band < thresholds.length && pixelArray[i] >= thresholds[band])
-        band++;
-      result[i] = band;
-    }
-    return result;
-  }
+    <script type="module">
+      import { Pane } from "tweakpane";
+      import * as TweakpaneFileImportPlugin from "tweakpane-plugin-file-import";
 
-  function extractPaths(image, width, height) {
-    let paths = {};
+      const page = document.getElementById("page");
+      const pageCtx = page.getContext("2d");
 
-    for (let y = 0; y < height; y++) {
-      const row = y * width;
-      let startX = 0;
-      let lastValue = image[row];
+      let colorBandCount = 6;
 
-      for (let x = 1; x <= width; x++) {
-        const color = x < width ? image[row + x] : -1;
-        if (color === lastValue) continue;
+      const viewNames = [
+        "original",
+        "grayscale",
+        "normalized",
+        "downsampled",
+        "quantized",
+        "plot",
+      ];
 
-        (paths[lastValue] ??= []).push([
-          { x: startX, y },
-          { x: x - 1, y },
-        ]);
-        startX = x;
-        lastValue = color;
+      const state = {
+        dw: 0,
+        dh: 0,
+        bmp: null,
+        grayscale: null,
+        normalized: null,
+        downsampled: null,
+        quantized: null,
+        paths: null,
+        views: {},
+      };
+
+      const params = {
+        imageFile: "",
+        pageWidthMM: 210,
+        pageHeightMM: 297,
+        offsetMM: { x: 0, y: 0 },
+        scale: 1.0,
+        selectedView: "original",
+        thresholds: Array.from(
+          { length: colorBandCount - 1 },
+          (_, k) => (k + 1) / colorBandCount,
+        ),
+        lineWidthMM: 1.0,
+        lineSpacing: 1.0,
+        columnPitchMM: 0.4,
+      };
+
+      // pipeline --------------------------------------------------------------
+
+      function imageSizeMM() {
+        const w = params.pageWidthMM * params.scale;
+        return { w, h: w * (state.bmp.height / state.bmp.width) };
       }
-    }
 
-    return paths;
-  }
-
-  function numberRow(parent, labelText, unit, key, opts) {
-    const label = document.createElement("label");
-    label.textContent = labelText;
-
-    const input = document.createElement("input");
-    input.type = "number";
-    input.min = opts.min;
-    input.max = opts.max;
-    input.step = opts.step;
-    input.value = params[key];
-
-    const unitEl = document.createElement("span");
-    unitEl.className = "unit";
-    unitEl.textContent = unit;
-
-    input.addEventListener("change", () => {
-      const v = Number(input.value);
-      if (!Number.isFinite(v) || v < opts.min || v > opts.max) {
-        input.value = params[key];
-        return;
+      async function decode(file) {
+        state.bmp?.close();
+        state.bmp = await createImageBitmap(file);
+        state.grayscale = toGrayscale(getPixels(state.bmp));
+        state.normalized = normalize(state.grayscale);
+        resample();
       }
-      params[key] = v;
-      reprocess();
-    });
 
-    parent.append(label, input, unitEl);
-  }
+      function resample() {
+        if (!state.bmp) return;
+        const { width, height } = state.bmp;
+        const { w, h } = imageSizeMM();
+        state.dw = Math.max(1, Math.floor(w / params.columnPitchMM));
+        state.dh = Math.max(
+          1,
+          Math.floor(h / (params.lineWidthMM * params.lineSpacing)),
+        );
+        state.downsampled = downsample(
+          state.normalized,
+          width,
+          height,
+          state.dw,
+          state.dh,
+        );
+        requantize();
+      }
 
-  function buildSizeControls() {
-    sizeControls.innerHTML = "";
-    numberRow(sizeControls, "page width", "mm", "pageWidthMM", {
-      min: 10,
-      max: 2000,
-      step: 5,
-    });
-    numberRow(sizeControls, "page height", "mm", "pageHeightMM", {
-      min: 10,
-      max: 2000,
-      step: 5,
-    });
-    numberRow(sizeControls, "margin", "mm", "marginMM", {
-      min: 0,
-      max: 200,
-      step: 1,
-    });
-    numberRow(sizeControls, "pen width", "mm", "lineWidthMM", {
-      min: 0.05,
-      max: 20,
-      step: 0.1,
-    });
-    numberRow(sizeControls, "overlap", "x", "overlap", {
-      min: 0.3,
-      max: 1,
-      step: 0.05,
-    });
-    numberRow(sizeControls, "col pitch", "mm", "colPitchMM", {
-      min: 0.05,
-      max: 10,
-      step: 0.1,
-    });
-    numberRow(sizeControls, "scale", "x", "scale", {
-      min: 0.05,
-      max: 2,
-      step: 0.05,
-    });
-  }
+      function requantize() {
+        if (!state.downsampled) return;
+        state.quantized = quantize(state.downsampled, params.thresholds);
+        state.paths = extractPaths(state.quantized, state.dw, state.dh);
+        rebuildViews();
+        draw();
+      }
 
-  function buildBandControls() {
-    bandControls.innerHTML = "";
+      function rebuildViews() {
+        const { width, height } = state.bmp;
+        const { dw, dh, grayscale, normalized, downsampled, quantized, paths } =
+          state;
+        state.views = {
+          original: rasterView(null, state.bmp),
+          grayscale: rasterView(
+            grayscale,
+            float32ArrayToCanvas(grayscale, width, height),
+          ),
+          normalized: rasterView(
+            normalized,
+            float32ArrayToCanvas(normalized, width, height),
+          ),
+          downsampled: rasterView(
+            downsampled,
+            float32ArrayToCanvas(downsampled, dw, dh),
+          ),
+          quantized: rasterView(
+            quantized,
+            float32ArrayToCanvas(
+              Float32Array.from(quantized, (v) => v / (colorBandCount - 1)),
+              dw,
+              dh,
+            ),
+          ),
+          plot: plotView(paths, dw, dh),
+        };
+      }
 
-    const countLabel = document.createElement("label");
-    countLabel.textContent = "count";
-    const count = document.createElement("input");
-    count.type = "number";
-    count.min = 2;
-    count.max = 8;
-    count.step = 1;
-    count.value = thresholds.length + 1;
+      function rasterView(data, canvas) {
+        return {
+          data,
+          draw: (ctx, x, y, w, h) => ctx.drawImage(canvas, x, y, w, h),
+        };
+      }
 
-    count.addEventListener("change", () => {
-      const n = Math.max(2, Math.min(8, Math.round(Number(count.value)) || 2));
-      count.value = n;
-      thresholds = Array.from({ length: n - 1 }, (_, k) => (k + 1) / n);
-      buildBandControls();
-      redraw();
-    });
+      function plotView(paths, dw, dh) {
+        const colors = Array.from(
+          { length: colorBandCount },
+          (_, i) => `hsl(${(i * 360) / colorBandCount} 70% 45%)`,
+        );
+        return {
+          data: paths,
+          draw: (ctx, x, y, w, h) => {
+            const cellW = w / dw;
+            const cellH = h / dh;
+            ctx.lineCap = "round";
+            ctx.lineWidth = params.lineWidthMM;
+            for (const [band, runs] of Object.entries(paths)) {
+              ctx.strokeStyle = colors[band];
+              ctx.beginPath();
+              for (const [a, b] of runs) {
+                const py = y + (a.y + 0.5) * cellH;
+                ctx.moveTo(x + (a.x + 0.5) * cellW, py);
+                ctx.lineTo(x + (b.x + 0.5) * cellW, py);
+              }
+              ctx.stroke();
+            }
+          },
+        };
+      }
 
-    bandControls.append(countLabel, count, document.createElement("span"));
+      function draw() {
+        const w = params.pageWidthMM;
+        const h = params.pageHeightMM;
 
-    thresholds.forEach((t, idx) => {
-      const label = document.createElement("label");
-      label.textContent = `t${idx}`;
+        page.style.setProperty("--ratio", w / h);
 
-      const slider = document.createElement("input");
-      slider.type = "range";
-      slider.min = 0;
-      slider.max = 1;
-      slider.step = THRESHOLD_STEP;
-      slider.value = t;
+        const rect = page.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const pxPerMM = (rect.width * dpr) / w;
 
-      const readout = document.createElement("span");
-      readout.textContent = t.toFixed(3);
+        page.width = Math.round(w * pxPerMM);
+        page.height = Math.round(h * pxPerMM);
 
-      slider.addEventListener("input", () => {
-        const lo = idx > 0 ? thresholds[idx - 1] + THRESHOLD_STEP : 0;
-        const hi =
-          idx < thresholds.length - 1
-            ? thresholds[idx + 1] - THRESHOLD_STEP
-            : 1;
-        const v = Math.max(lo, Math.min(hi, Number(slider.value)));
-        slider.value = v;
-        thresholds[idx] = v;
-        readout.textContent = v.toFixed(3);
-        redraw();
-      });
+        pageCtx.setTransform(1, 0, 0, 1, 0, 0);
+        pageCtx.clearRect(0, 0, page.width, page.height);
+        pageCtx.scale(pxPerMM, pxPerMM);
+        pageCtx.imageSmoothingEnabled = !["downsampled", "quantized"].includes(
+          params.selectedView,
+        );
+        pageCtx.imageSmoothingQuality = "high";
 
-      bandControls.append(label, slider, readout);
-    });
-  }
-</script>
+        const view = state.views[params.selectedView];
+        if (!view) return;
+
+        const { x, y } = params.offsetMM;
+        const { w: drawW, h: drawH } = imageSizeMM();
+        const baseW = w;
+        const baseH = baseW * (state.bmp.height / state.bmp.width);
+        const cx = x + baseW / 2;
+        const cy = y + baseH / 2;
+
+        view.draw(pageCtx, cx - drawW / 2, cy - drawH / 2, drawW, drawH);
+      }
+
+      // ui --------------------------------------------------------------------
+
+      const pane = new Pane();
+      pane.registerPlugin(TweakpaneFileImportPlugin);
+
+      const pageFolder = pane.addFolder({ title: "page" });
+      pageFolder
+        .addBinding(params, "pageWidthMM", { label: "page width" })
+        .on("change", resample);
+      pageFolder
+        .addBinding(params, "pageHeightMM", { label: "page height" })
+        .on("change", draw);
+
+      const imageFolder = pane.addFolder({ title: "image" });
+      imageFolder
+        .addBinding(params, "imageFile", {
+          view: "file-input",
+          lineCount: 1,
+          filetypes: [".png", ".jpg", ".jpeg"],
+          invalidFiletypeMessage: "We can't accept those filetypes!",
+        })
+        .on("change", (ev) => ev.value && decode(ev.value));
+      imageFolder
+        .addBinding(params, "offsetMM", { label: "offset" })
+        .on("change", draw);
+      imageFolder
+        .addBinding(params, "scale", { min: 0.05, max: 3 })
+        .on("change", resample);
+
+      const pathFolder = pane.addFolder({ title: "paths" });
+      pathFolder
+        .addBinding(params, "lineWidthMM", { label: "line width", min: 0.1 })
+        .on("change", resample);
+      pathFolder
+        .addBinding(params, "lineSpacing", { label: "line spacing", min: 0.1 })
+        .on("change", resample);
+      pathFolder
+        .addBinding(params, "columnPitchMM", {
+          label: "column pitch",
+          min: 0.05,
+        })
+        .on("change", resample);
+
+      const outputFolder = pane.addFolder({ title: "output" });
+      outputFolder
+        .addBinding(params, "selectedView", {
+          label: "view",
+          options: Object.fromEntries(viewNames.map((v) => [v, v])),
+        })
+        .on("change", draw);
+
+      new ResizeObserver(draw).observe(page);
+      draw();
+
+      // helper functions ------------------------------------------------------
+
+      function float32ArrayToCanvas(arr, w, h) {
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext("2d");
+        const img = ctx.createImageData(w, h);
+        const d = img.data;
+        for (let i = 0, p = 0; p < arr.length; i += 4, p++) {
+          const v = arr[p] * 255;
+          d[i] = d[i + 1] = d[i + 2] = v;
+          d[i + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+        return c;
+      }
+
+      function getPixels(bmp) {
+        const c = new OffscreenCanvas(bmp.width, bmp.height);
+        const ctx = c.getContext("2d");
+        ctx.drawImage(bmp, 0, 0);
+        return ctx.getImageData(0, 0, bmp.width, bmp.height).data;
+      }
+
+      function toGrayscale(pixels) {
+        const result = new Float32Array(pixels.length / 4);
+        for (let i = 0, p = 0; p < result.length; i += 4, p++) {
+          result[p] =
+            (0.2126 * pixels[i] +
+              0.7152 * pixels[i + 1] +
+              0.0722 * pixels[i + 2]) /
+            255;
+        }
+        return result;
+      }
+      function normalize(pixels) {
+        let min = Infinity;
+        let max = 0;
+        for (let i = 0; i < pixels.length; i++) {
+          const v = pixels[i];
+          if (v < min) min = v;
+          if (v > max) max = v;
+        }
+        const scale = max > min ? 1 / (max - min) : 0;
+
+        const result = new Float32Array(pixels.length);
+        for (let i = 0; i < result.length; i++) {
+          result[i] = (pixels[i] - min) * scale;
+        }
+        return result;
+      }
+
+      function downsample(src, sw, sh, dw, dh) {
+        const out = new Float32Array(dw * dh);
+        for (let outY = 0; outY < dh; outY++) {
+          const y0 = Math.floor((outY * sh) / dh);
+          const y1 = Math.max(y0 + 1, Math.floor(((outY + 1) * sh) / dh));
+          for (let outX = 0; outX < dw; outX++) {
+            const x0 = Math.floor((outX * sw) / dw);
+            const x1 = Math.max(x0 + 1, Math.floor(((outX + 1) * sw) / dw));
+
+            let sum = 0;
+            for (let y = y0; y < y1; y++) {
+              const row = y * sw;
+              for (let x = x0; x < x1; x++) sum += src[row + x];
+            }
+            out[outY * dw + outX] = sum / ((y1 - y0) * (x1 - x0));
+          }
+        }
+        return out;
+      }
+
+      function quantize(pixelArray, thresholds) {
+        const result = new Uint8ClampedArray(pixelArray.length);
+        for (let i = 0; i < pixelArray.length; i++) {
+          let band = 0;
+          while (band < thresholds.length && pixelArray[i] >= thresholds[band])
+            band++;
+          result[i] = band;
+        }
+        return result;
+      }
+
+      function extractPaths(image, width, height) {
+        const paths = {};
+
+        for (let y = 0; y < height; y++) {
+          const row = y * width;
+          let startX = 0;
+          let lastValue = image[row];
+
+          for (let x = 1; x <= width; x++) {
+            const color = x < width ? image[row + x] : -1;
+            if (color === lastValue) continue;
+
+            (paths[lastValue] ??= []).push([
+              { x: startX, y },
+              { x: x - 1, y },
+            ]);
+            startX = x;
+            lastValue = color;
+          }
+        }
+
+        return paths;
+      }
+    </script>
+  </body>
+</html>
