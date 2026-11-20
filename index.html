@@ -15,31 +15,27 @@
     }
 
     canvas {
-      --ratio: 1;
-      aspect-ratio: var(--ratio);
-      width: min(90svw, 90svh * var(--ratio));
-      height: auto;
-      background-color: white;
-    }
-
-    .container {
+      display: block;
       width: 100svw;
       height: 100svh;
-      display: flex;
-      justify-content: center;
-      align-items: center;
+      background-color: #5a5a5a;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    canvas:active {
+      cursor: grabbing;
     }
   </style>
   <body>
-    <div class="container">
-      <canvas id="page"></canvas>
-    </div>
+    <canvas id="page"></canvas>
 
     <script type="importmap">
       {
         "imports": {
           "tweakpane": "https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js",
-          "tweakpane-plugin-file-import": "https://unpkg.com/tweakpane-plugin-file-import@1.2.0/dist/tweakpane-plugin-file-import.js"
+          "tweakpane-plugin-file-import": "https://unpkg.com/tweakpane-plugin-file-import@1.2.0/dist/tweakpane-plugin-file-import.js",
+          "jszip": "https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm"
         }
       }
     </script>
@@ -47,11 +43,31 @@
     <script type="module">
       import { Pane } from "tweakpane";
       import * as TweakpaneFileImportPlugin from "tweakpane-plugin-file-import";
+      import JSZip from "jszip";
 
       const page = document.getElementById("page");
       const pageCtx = page.getContext("2d");
 
-      let colorBandCount = 6;
+      // Golden-angle hue steps: consecutive bands land far apart on the
+      // wheel regardless of how many there are, so neighbors stay distinct.
+      // Lightness alternates so hue-adjacent bands also differ in value.
+      function defaultColor(i) {
+        const hue = (200 + i * 137.508) % 360;
+        const light = i % 2 === 0 ? 0.38 : 0.52;
+        return hslToHex(hue, 0.7, light);
+      }
+
+      function hslToHex(h, s, l) {
+        const f = (k) => {
+          const a = s * Math.min(l, 1 - l);
+          const t = (k + h / 30) % 12;
+          const v = l - a * Math.max(-1, Math.min(t - 3, 9 - t, 1));
+          return Math.round(v * 255)
+            .toString(16)
+            .padStart(2, "0");
+        };
+        return `#${f(0)}${f(8)}${f(4)}`;
+      }
 
       const viewNames = [
         "original",
@@ -70,9 +86,11 @@
         normalized: null,
         downsampled: null,
         quantized: null,
-        paths: null,
+        paths: null, // cell space, per band
         views: {},
       };
+
+      const viewport = { zoom: 1, x: 0, y: 0 }; // pan in mm
 
       const params = {
         imageFile: "",
@@ -80,21 +98,65 @@
         pageHeightMM: 297,
         offsetMM: { x: 0, y: 0 },
         scale: 1.0,
-        selectedView: "original",
-        thresholds: Array.from(
-          { length: colorBandCount - 1 },
-          (_, k) => (k + 1) / colorBandCount,
-        ),
+        selectedView: "plot",
+        bandCount: 6,
+        bands: [], // [{ color, threshold }] — threshold is the band's upper bound
         lineWidthMM: 1.0,
         lineSpacing: 1.0,
         columnPitchMM: 0.4,
       };
+
+      // bands -----------------------------------------------------------------
+
+      function resetBands() {
+        const n = params.bandCount;
+        params.bands = Array.from({ length: n }, (_, i) => ({
+          color: params.bands[i]?.color ?? defaultColor(i),
+          enabled: params.bands[i]?.enabled ?? true,
+          threshold: (i + 1) / n,
+        }));
+      }
+
+      function thresholds() {
+        return params.bands.slice(0, -1).map((b) => b.threshold);
+      }
+
+      // Keep thresholds monotonic by pushing neighbors out of the way.
+      // Returns true if any neighbor moved.
+      function enforceMonotonic(changedIndex) {
+        const bands = params.bands;
+        const last = bands.length - 2; // last band with a threshold
+        const t = bands[changedIndex].threshold;
+        let moved = false;
+        for (let j = changedIndex + 1; j <= last; j++) {
+          if (bands[j].threshold < t) {
+            bands[j].threshold = t;
+            moved = true;
+          }
+        }
+        for (let j = changedIndex - 1; j >= 0; j--) {
+          if (bands[j].threshold > t) {
+            bands[j].threshold = t;
+            moved = true;
+          }
+        }
+        return moved;
+      }
 
       // pipeline --------------------------------------------------------------
 
       function imageSizeMM() {
         const w = params.pageWidthMM * params.scale;
         return { w, h: w * (state.bmp.height / state.bmp.width) };
+      }
+
+      // Where the image sits on the page, in mm. The image is centered on
+      // the page at offset (0, 0); offset moves its center, scale is about it.
+      function imagePlacement() {
+        const { w, h } = imageSizeMM();
+        const cx = params.pageWidthMM / 2 + params.offsetMM.x;
+        const cy = params.pageHeightMM / 2 + params.offsetMM.y;
+        return { x: cx - w / 2, y: cy - h / 2, w, h };
       }
 
       async function decode(file) {
@@ -126,7 +188,7 @@
 
       function requantize() {
         if (!state.downsampled) return;
-        state.quantized = quantize(state.downsampled, params.thresholds);
+        state.quantized = quantize(state.downsampled, thresholds());
         state.paths = extractPaths(state.quantized, state.dw, state.dh);
         rebuildViews();
         draw();
@@ -136,6 +198,7 @@
         const { width, height } = state.bmp;
         const { dw, dh, grayscale, normalized, downsampled, quantized, paths } =
           state;
+        const maxBand = params.bands.length - 1;
         state.views = {
           original: rasterView(null, state.bmp),
           grayscale: rasterView(
@@ -153,7 +216,7 @@
           quantized: rasterView(
             quantized,
             float32ArrayToCanvas(
-              Float32Array.from(quantized, (v) => v / (colorBandCount - 1)),
+              Float32Array.from(quantized, (v) => v / maxBand),
               dw,
               dh,
             ),
@@ -170,10 +233,6 @@
       }
 
       function plotView(paths, dw, dh) {
-        const colors = Array.from(
-          { length: colorBandCount },
-          (_, i) => `hsl(${(i * 360) / colorBandCount} 70% 45%)`,
-        );
         return {
           data: paths,
           draw: (ctx, x, y, w, h) => {
@@ -182,7 +241,9 @@
             ctx.lineCap = "round";
             ctx.lineWidth = params.lineWidthMM;
             for (const [band, runs] of Object.entries(paths)) {
-              ctx.strokeStyle = colors[band];
+              const b = params.bands[band];
+              if (b && !b.enabled) continue;
+              ctx.strokeStyle = b?.color ?? "#ff00ff";
               ctx.beginPath();
               for (const [a, b] of runs) {
                 const py = y + (a.y + 0.5) * cellH;
@@ -195,22 +256,49 @@
         };
       }
 
+      // Base mapping from page mm to CSS px: fit the page in the viewport
+      // with a margin, centered. Pan/zoom is applied on top of this.
+      function baseTransform() {
+        const rect = page.getBoundingClientRect();
+        const w = params.pageWidthMM;
+        const h = params.pageHeightMM;
+        const k = Math.min(rect.width / w, rect.height / h) * 0.9;
+        return {
+          k,
+          cx: (rect.width - w * k) / 2,
+          cy: (rect.height - h * k) / 2,
+          rect,
+        };
+      }
+
       function draw() {
         const w = params.pageWidthMM;
         const h = params.pageHeightMM;
 
-        page.style.setProperty("--ratio", w / h);
-
-        const rect = page.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
-        const pxPerMM = (rect.width * dpr) / w;
+        const { k, cx, cy, rect } = baseTransform();
 
-        page.width = Math.round(w * pxPerMM);
-        page.height = Math.round(h * pxPerMM);
+        page.width = Math.round(rect.width * dpr);
+        page.height = Math.round(rect.height * dpr);
 
         pageCtx.setTransform(1, 0, 0, 1, 0, 0);
-        pageCtx.clearRect(0, 0, page.width, page.height);
-        pageCtx.scale(pxPerMM, pxPerMM);
+        pageCtx.fillStyle = "#5a5a5a";
+        pageCtx.fillRect(0, 0, page.width, page.height);
+
+        // device px -> css px -> centered page mm -> pan/zoom
+        pageCtx.scale(dpr, dpr);
+        pageCtx.translate(cx, cy);
+        pageCtx.scale(k, k);
+        pageCtx.scale(viewport.zoom, viewport.zoom);
+        pageCtx.translate(viewport.x, viewport.y);
+
+        // the page itself; everything after this is clipped to it
+        pageCtx.fillStyle = "white";
+        pageCtx.fillRect(0, 0, w, h);
+        pageCtx.beginPath();
+        pageCtx.rect(0, 0, w, h);
+        pageCtx.clip();
+
         pageCtx.imageSmoothingEnabled = !["downsampled", "quantized"].includes(
           params.selectedView,
         );
@@ -219,14 +307,85 @@
         const view = state.views[params.selectedView];
         if (!view) return;
 
-        const { x, y } = params.offsetMM;
-        const { w: drawW, h: drawH } = imageSizeMM();
-        const baseW = w;
-        const baseH = baseW * (state.bmp.height / state.bmp.width);
-        const cx = x + baseW / 2;
-        const cy = y + baseH / 2;
+        const p = imagePlacement();
+        view.draw(pageCtx, p.x, p.y, p.w, p.h);
+      }
 
-        view.draw(pageCtx, cx - drawW / 2, cy - drawH / 2, drawW, drawH);
+      // export ----------------------------------------------------------------
+
+      const fmt = (v) => v.toFixed(3).replace(/\.?0+$/, "");
+
+      function svgDocument(bodyLines) {
+        const w = params.pageWidthMM;
+        const h = params.pageHeightMM;
+        return [
+          `<?xml version="1.0" encoding="UTF-8"?>`,
+          `<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"`,
+          `     width="${fmt(w)}mm" height="${fmt(h)}mm" viewBox="0 0 ${fmt(w)} ${fmt(h)}">`,
+          ...bodyLines,
+          `</svg>`,
+          ``,
+        ].join("\n");
+      }
+
+      function svgLayer(band, runs, id) {
+        const b = params.bands[band];
+        const lines = [
+          `  <g id="layer${id}" inkscape:groupmode="layer" inkscape:label="${id} band ${band}"`,
+          `     fill="none" stroke="${b.color}" stroke-width="${fmt(params.lineWidthMM)}" stroke-linecap="round">`,
+        ];
+        for (const [a, c] of runs) {
+          lines.push(`    <path d="M${fmt(a.x)} ${fmt(a.y)}H${fmt(c.x)}"/>`);
+        }
+        lines.push(`  </g>`);
+        return lines;
+      }
+
+      async function exportZip() {
+        if (!state.paths) return;
+
+        const pathsMM = layoutPaths(
+          state.paths,
+          state.dw,
+          state.dh,
+          imagePlacement(),
+          params.pageWidthMM,
+          params.pageHeightMM,
+        );
+
+        const zip = new JSZip();
+        const combined = [];
+        let id = 1;
+
+        for (const [band, runs] of Object.entries(pathsMM)) {
+          if (!params.bands[band]?.enabled) continue;
+          const layer = svgLayer(band, runs, id);
+          combined.push(...layer);
+          zip.file(`band-${band}.svg`, svgDocument(layer));
+          id++;
+        }
+
+        zip.file("combined.svg", svgDocument(combined));
+        zip.file(
+          "params.json",
+          JSON.stringify(
+            {
+              ...params,
+              imageFile: params.imageFile?.name ?? "",
+              exportedAt: new Date().toISOString(),
+            },
+            null,
+            2,
+          ),
+        );
+
+        const blob = await zip.generateAsync({ type: "blob" });
+        const stem = (params.imageFile?.name ?? "plot").replace(/\.[^.]+$/, "");
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `${stem}-plot.zip`;
+        a.click();
+        URL.revokeObjectURL(a.href);
       }
 
       // ui --------------------------------------------------------------------
@@ -236,11 +395,17 @@
 
       const pageFolder = pane.addFolder({ title: "page" });
       pageFolder
-        .addBinding(params, "pageWidthMM", { label: "page width" })
-        .on("change", resample);
+        .addBinding(params, "pageWidthMM", { label: "page width", min: 1 })
+        .on("change", () => {
+          rebuildOffsetControl();
+          resample();
+        });
       pageFolder
-        .addBinding(params, "pageHeightMM", { label: "page height" })
-        .on("change", draw);
+        .addBinding(params, "pageHeightMM", { label: "page height", min: 1 })
+        .on("change", () => {
+          rebuildOffsetControl();
+          draw();
+        });
 
       const imageFolder = pane.addFolder({ title: "image" });
       imageFolder
@@ -251,12 +416,31 @@
           invalidFiletypeMessage: "We can't accept those filetypes!",
         })
         .on("change", (ev) => ev.value && decode(ev.value));
-      imageFolder
-        .addBinding(params, "offsetMM", { label: "offset" })
-        .on("change", draw);
+      // Offset limits depend on page size, and tweakpane can't change a
+      // binding's limits after creation, so rebuild it in place.
+      let offsetBinding = null;
       imageFolder
         .addBinding(params, "scale", { min: 0.05, max: 3 })
         .on("change", resample);
+
+      function rebuildOffsetControl() {
+        const w = params.pageWidthMM / 2;
+        const h = params.pageHeightMM / 2;
+        const o = params.offsetMM;
+        o.x = Math.max(-w, Math.min(w, o.x));
+        o.y = Math.max(-h, Math.min(h, o.y));
+
+        offsetBinding?.dispose();
+        offsetBinding = imageFolder
+          .addBinding(params, "offsetMM", {
+            label: "offset",
+            x: { min: -w, max: w },
+            y: { min: -h, max: h },
+            index: 1, // keep it between the file input and scale
+          })
+          .on("change", draw);
+      }
+      rebuildOffsetControl();
 
       const pathFolder = pane.addFolder({ title: "paths" });
       pathFolder
@@ -272,6 +456,63 @@
         })
         .on("change", resample);
 
+      const bandFolder = pane.addFolder({ title: "bands" });
+      bandFolder
+        .addBinding(params, "bandCount", {
+          label: "count",
+          min: 2,
+          max: 12,
+          step: 1,
+        })
+        .on("change", () => {
+          resetBands();
+          rebuildBandControls();
+          requantize();
+        });
+
+      const thresholdFolder = pane.addFolder({ title: "thresholds" });
+      const colorFolder = pane.addFolder({ title: "colors" });
+
+      let bandControls = [];
+      let thresholdBindings = [];
+
+      function rebuildBandControls() {
+        for (const c of bandControls) c.dispose();
+        bandControls = [];
+        thresholdBindings = [];
+
+        params.bands.forEach((band, i) => {
+          if (i < params.bands.length - 1) {
+            const b = thresholdFolder
+              .addBinding(band, "threshold", {
+                label: `${i} | ${i + 1}`,
+                min: 0,
+                max: 1,
+                step: 0.01,
+              })
+              .on("change", () => {
+                if (enforceMonotonic(i)) {
+                  for (const tb of thresholdBindings) tb.refresh();
+                }
+                requantize();
+              });
+            thresholdBindings.push(b);
+            bandControls.push(b);
+          }
+
+          bandControls.push(
+            colorFolder
+              .addBinding(band, "color", { label: `band ${i}` })
+              .on("change", draw),
+          );
+          bandControls.push(
+            colorFolder
+              .addBinding(band, "enabled", { label: "" })
+              .on("change", draw),
+          );
+        });
+      }
+
       const outputFolder = pane.addFolder({ title: "output" });
       outputFolder
         .addBinding(params, "selectedView", {
@@ -279,6 +520,59 @@
           options: Object.fromEntries(viewNames.map((v) => [v, v])),
         })
         .on("change", draw);
+      outputFolder.addButton({ title: "download zip" }).on("click", exportZip);
+
+      resetBands();
+      rebuildBandControls();
+
+      // pan / zoom ------------------------------------------------------------
+
+      function mouseToMM(ev) {
+        const { k, cx, cy, rect } = baseTransform();
+        const sx = (ev.clientX - rect.left - cx) / k; // page mm, before pan/zoom
+        const sy = (ev.clientY - rect.top - cy) / k;
+        return {
+          sx,
+          sy,
+          x: sx / viewport.zoom - viewport.x,
+          y: sy / viewport.zoom - viewport.y,
+        };
+      }
+
+      page.addEventListener(
+        "wheel",
+        (ev) => {
+          ev.preventDefault();
+          const { sx, sy, x, y } = mouseToMM(ev);
+          const factor = Math.exp(-ev.deltaY * 0.002);
+          viewport.zoom = Math.min(50, Math.max(0.2, viewport.zoom * factor));
+          viewport.x = sx / viewport.zoom - x; // keep (x, y) under the cursor
+          viewport.y = sy / viewport.zoom - y;
+          draw();
+        },
+        { passive: false },
+      );
+
+      let drag = null;
+      page.addEventListener("pointerdown", (ev) => {
+        drag = { sx: ev.clientX, sy: ev.clientY, x: viewport.x, y: viewport.y };
+        page.setPointerCapture(ev.pointerId);
+      });
+      page.addEventListener("pointermove", (ev) => {
+        if (!drag) return;
+        const k = baseTransform().k * viewport.zoom;
+        viewport.x = drag.x + (ev.clientX - drag.sx) / k;
+        viewport.y = drag.y + (ev.clientY - drag.sy) / k;
+        draw();
+      });
+      page.addEventListener("pointerup", () => (drag = null));
+      page.addEventListener("pointercancel", () => (drag = null));
+      page.addEventListener("dblclick", () => {
+        viewport.zoom = 1;
+        viewport.x = 0;
+        viewport.y = 0;
+        draw();
+      });
 
       new ResizeObserver(draw).observe(page);
       draw();
@@ -319,9 +613,10 @@
         }
         return result;
       }
+
       function normalize(pixels) {
         let min = Infinity;
-        let max = 0;
+        let max = -Infinity;
         for (let i = 0; i < pixels.length; i++) {
           const v = pixels[i];
           if (v < min) min = v;
@@ -365,6 +660,33 @@
           result[i] = band;
         }
         return result;
+      }
+
+      // Export-time only. Convert cell-space runs to page-mm runs (through
+      // cell centers), clamping each run to the page and dropping runs fully
+      // outside it. Not used by the preview, which clips on the canvas.
+      function layoutPaths(paths, dw, dh, placement, pageW, pageH) {
+        const cellW = placement.w / dw;
+        const cellH = placement.h / dh;
+        const out = {};
+        for (const [band, runs] of Object.entries(paths)) {
+          const list = [];
+          for (const [a, b] of runs) {
+            const y = placement.y + (a.y + 0.5) * cellH;
+            if (y < 0 || y > pageH) continue;
+            let x0 = placement.x + (a.x + 0.5) * cellW;
+            let x1 = placement.x + (b.x + 0.5) * cellW;
+            if (x1 < 0 || x0 > pageW) continue;
+            x0 = Math.max(0, x0);
+            x1 = Math.min(pageW, x1);
+            list.push([
+              { x: x0, y },
+              { x: x1, y },
+            ]);
+          }
+          if (list.length) out[band] = list;
+        }
+        return out;
       }
 
       function extractPaths(image, width, height) {
